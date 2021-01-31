@@ -2,31 +2,38 @@
 
 # Currently working:
 # * places photos into correct albums and folder structure
-# * sets title, description, keywords, location
+# * sets title, description, keywords, location, favorite
 # Limitations:
 # * doesn't currently handle Live Photos or RAW+JPEG pairs
 # * only merges the most recent version of the photo (edit history is lost)
 # * very limited error handling
 # * doesn't merge Person In Image
 
+# TODO: add --update (currently it skips updated)
+
+import datetime
+import json
 import os
 import pathlib
 import sqlite3
 import tempfile
 
 import click
+import osxphotos
 import photoscript
 
-import osxphotos
+from .mergedb import MergeDB, MergeDBInMemory
+from ._version import __version__
 
 CLI_COLOR_ERROR = "red"
 CLI_COLOR_WARNING = "yellow"
 
 VERBOSE = False
+""" global flag for verbose_ function """
 
 
 def verbose_(*args, **kwargs):
-    """Print output if verbose flag set """
+    """Print output if flag set """
     if VERBOSE:
         styled_args = []
         for arg in args:
@@ -37,22 +44,6 @@ def verbose_(*args, **kwargs):
                     arg = click.style(arg, fg=CLI_COLOR_WARNING)
             styled_args.append(arg)
         click.echo(*styled_args, **kwargs)
-
-
-class MergeDB:
-    """Database to checkpoint merge progress """
-
-    def __init__(self, dbpath):
-        if type(dbpath) != pathlib.Path:
-            dbpath = pathlib.Path(dbpath)
-        self._dbpath = dbpath
-        self._db = self._open_db(dbpath) if dbpath.exists else self._create_db(dbpath)
-
-    def _open_db(self, dbpath):
-        print(f"_open_db: {dbpath}")
-
-    def _create_db(self, dbpath):
-        print(f"_create_db: {dbpath}")
 
 
 @click.command()
@@ -78,7 +69,9 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
     src_library = pathlib.Path(src_library).expanduser()
 
     if src_library.samefile(dest_library):
-        click.secho(f"src_library and dest_library cannot be the same", fg="red")
+        click.secho(
+            f"src_library and dest_library cannot be the same", fg=CLI_COLOR_ERROR
+        )
         raise click.Abort()
 
     verbose_(f"Opening source library {src_library}")
@@ -87,7 +80,22 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
 
     verbose_(f"Opening destination library {dest_library}")
     mergedb_path = dest_library.parent / f".{dest_library.stem}.osxphotos_merge.db"
-    mergedb = MergeDB(mergedb_path)
+
+    if dry_run:
+        mergedb = MergeDBInMemory(
+            mergedb_path,
+            source_library=src_library,
+            destination_library=dest_library,
+            verbose=verbose_,
+        )
+    else:
+        mergedb = MergeDB(
+            mergedb_path,
+            source_library=src_library,
+            destination_library=dest_library,
+            verbose=verbose_,
+        )
+
     dest = photoscript.PhotosLibrary()
     dest.open(dest_library)
     dest.hide()
@@ -97,23 +105,40 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
     fp = open(os.devnull, "w") if verbose else None
     with click.progressbar(src_photos, file=fp) as bar:
         for src_photo in bar:
-            path = src_photo.path_edited if src_photo.hasadjustments else src_photo.path
-            if not path:
-                click.secho(
-                    f"Skipping missing photo {src_photo.original_filename} ({src_photo.uuid})",
-                    fg="red",
+            if mergedb.get(src_photo.uuid, imported=True):
+                verbose_(
+                    f"Skipping previously imported photo {src_photo.original_filename} ({src_photo.uuid})"
                 )
                 continue
 
+            merge_record = {
+                "src_uuid": src_photo.uuid,
+                "src_original_filename": src_photo.original_filename,
+                "version": __version__,
+                "date": datetime.datetime.now().isoformat(),
+                "imported": False,
+                "skipped": False,
+            }
+            path = src_photo.path_edited if src_photo.hasadjustments else src_photo.path
+            merge_record["src_path"] = path
+            if not path:
+                click.secho(
+                    f"Skipping missing photo {src_photo.original_filename} ({src_photo.uuid})",
+                    fg=CLI_COLOR_WARNING,
+                )
+                merge_record["skipped"] = True
+                mergedb.upsert(merge_record)
+                continue
+
             # export photo to temp file and rename to original_filename
-            # handling of RAW+JPEG pairs, Live photos, favorites, etc. left as exercise for the reader
+            # handling of RAW+JPEG pairs, Live photos, etc. left as exercise for the reader
             # RAW+JPEG pairs will be correctly handled if imported like this:
             # dest.import_photos(["/Users/rhet/Desktop/export/IMG_1994.JPG", "/Users/rhet/Desktop/export/IMG_1994.cr2"])
             # Live Photos will be correctly handled if imported like this:
             # dest.import_photos(["/Users/rhet/Desktop/export/IMG_3259.HEIC","/Users/rhet/Desktop/export/IMG_3259.mov"])
             ext = pathlib.Path(path).suffix
             dest_file = pathlib.Path(src_photo.original_filename).stem + ext
-            verbose_(f"Importing photo {dest_file}")
+            verbose_(f"Importing photo {dest_file} ({src_photo.uuid})")
             with tempfile.TemporaryDirectory() as tmpdir:
                 # get right suffix for original or edited file
                 if not dry_run:
@@ -129,12 +154,14 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
                             f"Error exporting photo {src_photo.original_filename} ({src_photo.uuid})",
                             fg=CLI_COLOR_ERROR,
                         )
-                        continue
-                    exported = [
-                        str(pathlib.Path(tmpdir) / filename) for filename in exported
-                    ]
-                    print(exported)
+                        merge_record["export_error"] = True
+                        mergedb.upsert(merge_record)
 
+                        continue
+
+                    merge_record["exported"] = [
+                        str(pathlib.Path(f).name) for f in exported
+                    ]
                     dest_photos = dest.import_photos(
                         exported, skip_duplicate_check=True
                     )
@@ -143,11 +170,26 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
                             f"Error importing photo {src_photo.original_filename} ({src_photo.uuid})",
                             fg=CLI_COLOR_ERROR,
                         )
+                        merge_record["import_error"] = True
+                        mergedb.upsert(merge_record)
                         continue
 
+                    merge_record["import_uuid"] = [p.uuid for p in dest_photos]
+                    folder_albums = src_photo.render_template("{folder_album,}")
+                    folder_albums = (
+                        folder_albums[0] if folder_albums[0][0] != "" else []
+                    )
+                    merge_record["metadata"] = {
+                        "favorite": src_photo.favorite,
+                        "description": src_photo.description,
+                        "title": src_photo.title,
+                        "keywords": src_photo.keywords,
+                        "folder_albums": folder_albums,
+                        "persons": src_photo.persons,
+                    }
                     for dest_photo in dest_photos:
                         verbose_(f"Setting metadata for {dest_photo.filename}")
-                        # todo: add favorite
+                        dest_photo.favorite = src_photo.favorite
                         dest_photo.description = src_photo.description
                         dest_photo.title = src_photo.title
                         if src_photo.persons:
@@ -180,9 +222,8 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
                                 f"Adding {dest_photo.filename} to album {album.title}"
                             )
                             dest_album.add([dest_photo])
+                    merge_record["imported"] = True
+                    mergedb.upsert(merge_record)
+
     if fp is not None:
         fp.close()
-
-
-if __name__ == "__main__":
-    merge()
