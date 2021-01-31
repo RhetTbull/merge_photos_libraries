@@ -36,7 +36,7 @@ py_ver = float(".".join(platform.python_version_tuple()[:2]))
 
 setup(
     name="merge-photos-libraries",
-    version="0.0.1",
+    version="0.0.2",
     description="Merge Apple Photos libraries",
     long_description="Merge Apple Photos libraries into a single library.",
     author="Rhet Turnbull",
@@ -58,8 +58,9 @@ setup(
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
     install_requires=[
-        "photoscript>=0.1.0",
+        "photoscript>=0.1.1",
         "osxphotos>=0.40.3",
+        "tinydb==4.3.0",
     ],
     entry_points={"console_scripts": ["merge_photos=merge_photos_libraries.__main__:cli"]},
     include_package_data=True,

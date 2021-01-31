@@ -79,7 +79,7 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
     src_photos = src.photos()
 
     verbose_(f"Opening destination library {dest_library}")
-    mergedb_path = dest_library.parent / f".{dest_library.stem}.osxphotos_merge.db"
+    mergedb_path = dest_library.parent / f"{dest_library.stem}.osxphotos_merge.db"
 
     if dry_run:
         mergedb = MergeDBInMemory(
@@ -193,10 +193,12 @@ def merge(ctx, src_library, dest_library, verbose, dry_run):
                         dest_photo.description = src_photo.description
                         dest_photo.title = src_photo.title
                         if src_photo.persons:
+                            #TODO: this should be a --person-keyword flag
                             # add keywords for each person
-                            dest_photo.keywords = src_photo.keywords + [
-                                f"People/{p}" for p in src_photo.persons
-                            ]
+                            # dest_photo.keywords = src_photo.keywords + [
+                            #     f"People/{p}" for p in src_photo.persons
+                            # ]
+                            dest_photo.keywords = src_photo.keywords
                         else:
                             dest_photo.keywords = src_photo.keywords
                         if src_photo.location[0]:
